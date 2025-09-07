@@ -14,6 +14,7 @@ from telegram.ext import (
     filters,
     ContextTypes
 )
+from telegram.error import TelegramError
 from mega import Mega
 import json
 from datetime import datetime
@@ -37,6 +38,7 @@ CONFIG = {
     "PROCESSED_DIR": "processed",
     "MAX_THREADS": 15,
     "BOT_BRAND": "💎 Powered by @VALID_EDU_MAIL | https://t.me/VALID_EDU_MAIL",
+    "REQUIRED_CHATS": [-1002636011563, -1002587266245, -1002097395897],
 }
 
 bot_start_time = time.time()
@@ -59,6 +61,40 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# --------- FORCE JOIN CHECK -----------
+async def check_membership(user_id, context: ContextTypes.DEFAULT_TYPE):
+    not_joined_chats = []
+    for chat_id in CONFIG["REQUIRED_CHATS"]:
+        try:
+            member = await context.bot.get_chat_member(chat_id, user_id)
+            if member.status in ['left', 'kicked', 'restricted']:
+                not_joined_chats.append(chat_id)
+            elif member.status not in ['member', 'administrator', 'creator']:
+                not_joined_chats.append(chat_id)
+        except TelegramError as e:
+            logger.error(f"Failed to check membership for chat {chat_id}, user {user_id}: {str(e)}")
+            not_joined_chats.append(chat_id)  # Treat as not joined if check fails
+    return not_joined_chats
+
+async def get_join_message(not_joined_chats, context: ContextTypes.DEFAULT_TYPE, is_warning=False):
+    keyboard = []
+    msg = (
+        "🚨 To use this bot, you must join **all** of our channels/groups:\n\n" if not is_warning else
+        "😡 Don't be oversmart! You've left our channels/groups after joining. Join **all** back to use the bot:\n\n"
+    )
+    for chat_id in not_joined_chats:
+        try:
+            chat = await context.bot.get_chat(chat_id)
+            invite_link = await context.bot.export_chat_invite_link(chat_id)
+            title = chat.title or f"Channel/Group {chat_id}"
+            msg += f"• {title} ({chat_id})\n"
+            keyboard.append([InlineKeyboardButton(f"Join {title}", url=invite_link)])
+        except TelegramError as e:
+            logger.error(f"Error getting invite link for {chat_id}: {str(e)}")
+            msg += f"• Channel/Group {chat_id} (Contact admin for invite link)\n"
+    msg += "\nAfter joining **all**, try again. Stay fair and enjoy! 😊"
+    return msg, InlineKeyboardMarkup(keyboard)
 
 # --------- FILE AND DATA HELPERS ----------
 def load_user_data():
@@ -91,7 +127,8 @@ def user_stat_inc(user_id, key, incr=1):
         "join_date": int(time.time()),
         "last_used": int(time.time()),
         "first_name": "",
-        "username": ""
+        "username": "",
+        "has_joined_before": False
     })
     ud[key] = ud.get(key, 0) + incr
     ud["last_used"] = int(time.time())
@@ -106,7 +143,8 @@ def user_stat_set(user_id, key, val):
         "join_date": int(time.time()),
         "last_used": int(time.time()),
         "first_name": "",
-        "username": ""
+        "username": "",
+        "has_joined_before": False
     })
     ud[key] = val
     ud["last_used"] = int(time.time())
@@ -159,6 +197,25 @@ def process_queue():
                     processing_stats[user_id] = {"total": 0, "valid": 0, "invalid": 0}
             if current_processing:
                 user_id, file_path, context = current_processing
+                # Check membership before processing
+                not_joined = asyncio.run_coroutine_threadsafe(
+                    check_membership(int(user_id), context), asyncio.get_event_loop()
+                ).result()
+                if not_joined:
+                    is_warning = user_data["users"].get(user_id, {}).get("has_joined_before", False)
+                    msg, reply_markup = asyncio.run_coroutine_threadsafe(
+                        get_join_message(not_joined, context, is_warning), asyncio.get_event_loop()
+                    ).result()
+                    asyncio.run_coroutine_threadsafe(
+                        context.bot.send_message(chat_id=user_id, text=msg, reply_markup=reply_markup),
+                        asyncio.get_event_loop()
+                    )
+                    os.remove(file_path)
+                    with processing_lock:
+                        if user_id in processing_stats:
+                            del processing_stats[user_id]
+                        current_processing = None
+                    continue
                 try:
                     process_user_file(user_id, file_path, context)
                 except Exception as e:
@@ -311,6 +368,16 @@ def check_admin(uid):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
+    if not check_admin(int(user_id)):  # Admins bypass membership check
+        not_joined = await check_membership(int(user_id), context)
+        ud = user_data["users"].get(user_id, {})
+        has_joined_before = ud.get("has_joined_before", False)
+        if not_joined:
+            is_warning = has_joined_before
+            msg, reply_markup = await get_join_message(not_joined, context, is_warning)
+            await update.message.reply_text(msg, reply_markup=reply_markup, parse_mode="Markdown")
+            return
+        user_stat_set(user_id, "has_joined_before", True)
     username = update.effective_user.username or "N/A"
     first_name = update.effective_user.first_name or "Unknown"
     if user_id not in user_data["users"]:
@@ -322,7 +389,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "join_date": int(time.time()),
             "last_used": int(time.time()),
             "first_name": first_name,
-            "username": username
+            "username": username,
+            "has_joined_before": True
         }
         save_user_data()
     await update.message.reply_text(
@@ -337,6 +405,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if not check_admin(int(user_id)):
+        not_joined = await check_membership(int(user_id), context)
+        ud = user_data["users"].get(user_id, {})
+        has_joined_before = ud.get("has_joined_before", False)
+        if not_joined:
+            is_warning = has_joined_before
+            msg, reply_markup = await get_join_message(not_joined, context, is_warning)
+            await update.message.reply_text(msg, reply_markup=reply_markup, parse_mode="Markdown")
+            return
+        user_stat_set(user_id, "has_joined_before", True)
     msg = (
         "<b>Account Checker Bot Help</b>\n\n"
         "• Upload a .txt file with <code>mail:pass</code> on each line.\n"
@@ -353,6 +432,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
+    if not check_admin(int(user_id)):
+        not_joined = await check_membership(int(user_id), context)
+        ud = user_data["users"].get(user_id, {})
+        has_joined_before = ud.get("has_joined_before", False)
+        if not_joined:
+            is_warning = has_joined_before
+            msg, reply_markup = await get_join_message(not_joined, context, is_warning)
+            await update.message.reply_text(msg, reply_markup=reply_markup, parse_mode="Markdown")
+            return
+        user_stat_set(user_id, "has_joined_before", True)
     stats = user_data["users"].get(user_id, {})
     msg = (
         f"Your stats:\n"
@@ -364,6 +453,16 @@ async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
+    if not check_admin(int(user_id)):
+        not_joined = await check_membership(int(user_id), context)
+        ud = user_data["users"].get(user_id, {})
+        has_joined_before = ud.get("has_joined_before", False)
+        if not_joined:
+            is_warning = has_joined_before
+            msg, reply_markup = await get_join_message(not_joined, context, is_warning)
+            await update.message.reply_text(msg, reply_markup=reply_markup, parse_mode="Markdown")
+            return
+        user_stat_set(user_id, "has_joined_before", True)
     with processing_lock:
         if current_processing and current_processing[0] == user_id:
             stats = processing_stats.get(user_id, {})
@@ -392,6 +491,16 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
+    if not check_admin(int(user_id)):
+        not_joined = await check_membership(int(user_id), context)
+        ud = user_data["users"].get(user_id, {})
+        has_joined_before = ud.get("has_joined_before", False)
+        if not_joined:
+            is_warning = has_joined_before
+            msg, reply_markup = await get_join_message(not_joined, context, is_warning)
+            await update.message.reply_text(msg, reply_markup=reply_markup, parse_mode="Markdown")
+            return
+        user_stat_set(user_id, "has_joined_before", True)
     doc = update.message.document
     if not doc.file_name.lower().endswith(".txt"):
         await update.message.reply_text("Please upload a .txt file (mail:pass per line).")
@@ -422,7 +531,16 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not check_admin(update.effective_user.id):
+    user_id = str(update.effective_user.id)
+    if not check_admin(int(user_id)):
+        not_joined = await check_membership(int(user_id), context)
+        ud = user_data["users"].get(user_id, {})
+        has_joined_before = ud.get("has_joined_before", False)
+        if not_joined:
+            is_warning = has_joined_before
+            msg, reply_markup = await get_join_message(not_joined, context, is_warning)
+            await update.message.reply_text(msg, reply_markup=reply_markup, parse_mode="Markdown")
+            return
         await update.message.reply_text("Admin only.")
         return
     keyboard = [
