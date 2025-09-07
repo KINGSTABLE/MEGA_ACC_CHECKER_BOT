@@ -332,7 +332,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Use /status to check your job, /help for commands.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("💎 Our Channel", url="https://t.me/YourChannel")]
+            [InlineKeyboardButton("💎 Our Channel", url="https://t.me/VALID_EDU_MAIL")]
         ])
     )
 
