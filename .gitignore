@@ -1,0 +1,7 @@
+*.log
+data/
+results/
+queue/
+processed/
+__pycache__/
+*.pyc
