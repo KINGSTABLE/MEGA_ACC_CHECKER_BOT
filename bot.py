@@ -36,7 +36,7 @@ CONFIG = {
     "RESULTS_DIR": "results",
     "QUEUE_DIR": "queue",
     "PROCESSED_DIR": "processed",
-    "MAX_THREADS": 15,
+    "MAX_THREADS": 10,
     "BOT_BRAND": "💎 Powered by @VALID_EDU_MAIL | https://t.me/VALID_EDU_MAIL",
     "REQUIRED_CHATS": [-1002636011563, -1002587266245, -1002097395897],
 }
@@ -87,12 +87,12 @@ async def get_join_message(not_joined_chats, context: ContextTypes.DEFAULT_TYPE,
         try:
             chat = await context.bot.get_chat(chat_id)
             invite_link = await context.bot.export_chat_invite_link(chat_id)
-            title = chat.title or f"Channel/Group {chat_id}"
-            msg += f"• {title} ({chat_id})\n"
+            title = chat.title or "Channel/Group"
+            msg += f"• {title}\n"
             keyboard.append([InlineKeyboardButton(f"Join {title}", url=invite_link)])
         except TelegramError as e:
             logger.error(f"Error getting invite link for {chat_id}: {str(e)}")
-            msg += f"• Channel/Group {chat_id} (Contact admin for invite link)\n"
+            msg += f"• Channel/Group (Contact admin for invite link)\n"
     msg += "\nAfter joining **all**, try again. Stay fair and enjoy! 😊"
     return msg, InlineKeyboardMarkup(keyboard)
 
@@ -207,7 +207,7 @@ def process_queue():
                         get_join_message(not_joined, context, is_warning), asyncio.get_event_loop()
                     ).result()
                     asyncio.run_coroutine_threadsafe(
-                        context.bot.send_message(chat_id=user_id, text=msg, reply_markup=reply_markup),
+                        context.bot.send_message(chat_id=user_id, text=msg, reply_markup=reply_markup, parse_mode="Markdown"),
                         asyncio.get_event_loop()
                     )
                     os.remove(file_path)
