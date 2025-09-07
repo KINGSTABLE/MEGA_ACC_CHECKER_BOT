@@ -36,7 +36,7 @@ CONFIG = {
     "RESULTS_DIR": "results",
     "QUEUE_DIR": "queue",
     "PROCESSED_DIR": "processed",
-    "MAX_THREADS": 10,
+    "MAX_THREADS": 15,
     "BOT_BRAND": "💎 Powered by @VALID_EDU_MAIL | https://t.me/VALID_EDU_MAIL",
     "REQUIRED_CHATS": [-1002636011563, -1002587266245, -1002097395897],
 }
